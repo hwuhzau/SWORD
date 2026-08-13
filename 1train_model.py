@@ -8,15 +8,41 @@ from sklearn.metrics import r2_score
 from sklearn.preprocessing import StandardScaler
 import copy
 import random
+from pathlib import Path
 from joblib import Parallel, delayed
 from tqdm import tqdm
 
-random.seed(2025)
-np.random.seed(2025)
-torch.manual_seed(2025)
-torch.cuda.manual_seed_all(2025)
+BASE_SEED = 2025
+N_JOBS = -1
+
+
+def set_random_seed(seed):
+    """Reset every RNG used by one independently scheduled task."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.use_deterministic_algorithms(True)
+    torch.set_num_threads(1)
+
+
+def make_task_seed(gene_index, fold_idx, shuffle_id=0):
+    """Create a stable unique seed from gene, fold and shuffle coordinates."""
+    if gene_index < 0 or fold_idx < 0 or shuffle_id < 0:
+        raise ValueError("Task coordinates must be non-negative")
+    if fold_idx >= 100 or shuffle_id >= 1000:
+        raise ValueError("fold_idx or shuffle_id exceeds the seed layout")
+    seed = BASE_SEED + gene_index * 100_000 + shuffle_id * 100 + fold_idx
+    if seed >= 2**32:
+        raise ValueError("Task seed exceeds NumPy's supported range")
+    return seed
+
+
+set_random_seed(BASE_SEED)
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
+torch.use_deterministic_algorithms(True)
+torch.set_num_threads(1)
 
 
 def ld_pruning(X, threshold=0.8):
@@ -232,19 +258,33 @@ def fit(x_train, y_train, x_val, y_val, x_test, y_test, omics_dims, num_snps, te
     return r2, output_m, test_idx, y_test, y_pred.numpy(), contrib_snp, contrib_rna, contrib_ribo, contrib_pro
 
 
-pheno = pd.read_csv(r"./sample_174.csv").iloc[:, 1]
+SCRIPT_DIR = Path(__file__).resolve().parent
+SOURCE_DATA_DIR = SCRIPT_DIR.parent / "code_v1"
+
+
+def input_file(filename):
+    local_file = SCRIPT_DIR / filename
+    return local_file if local_file.is_file() else SOURCE_DATA_DIR / filename
+
+
+pheno = pd.read_csv(input_file("sample_174.csv")).iloc[:, 1]
 pheno = np.array(pheno)
-snp_data = pd.read_csv(r"./snp_2247428_174_012.csv")
-rna_data = pd.read_csv(r"./rna_174_28279_norm.csv")
-ribo_data = pd.read_csv(r"./ribo_174_18426_norm.csv")
-pro_data = pd.read_csv(r"./pro_174_6210_norm.csv")
-id_all_gene = pd.read_csv(r"gene_test.csv").iloc[:, 0].unique().tolist()
+snp_data = pd.read_csv(input_file("snp_2247428_174_012.csv"))
+rna_data = pd.read_csv(input_file("rna_174_28279_norm.csv"))
+# ribo_data = pd.DataFrame([])
+ribo_data = pd.read_csv(input_file("ribo_174_18426_norm.csv"))
+pro_data = pd.read_csv(input_file("pro_174_6210_norm.csv"))
+# id_all_gene = pd.read_csv(r"all_geneid.csv").iloc[:, 0].unique().tolist()[:30]
+id_all_gene = pd.read_csv(input_file("gene_test.csv")).iloc[:, 0].unique().tolist()
 
 kf = KFold(n_splits=10, shuffle=True, random_state=1)
 kf_splits = list(kf.split(range(len(pheno))))
 
 
-def run_gene_fold(id_genei, fold_idx):
+def run_gene_fold(gene_index, id_genei, fold_idx):
+    task_seed = make_task_seed(gene_index, fold_idx, shuffle_id=0)
+    set_random_seed(task_seed)
+
     gene_genei = None
     snp_subset = snp_data[snp_data.iloc[:, 2] == id_genei]
     if len(snp_subset) > 0:
@@ -319,7 +359,8 @@ def run_gene_fold(id_genei, fold_idx):
         "r2": r2,
         "subnet": best_subnet.tolist(),
         "omics_dims": omics_dims,
-        "num_snps": num_snps
+        "num_snps": num_snps,
+        "task_seed": task_seed
     }
     
     contribution_results = []
@@ -339,10 +380,15 @@ def run_gene_fold(id_genei, fold_idx):
     return summary_result, contribution_results
 
 
-all_tasks = [(id_genei, fold_idx) for id_genei in id_all_gene for fold_idx in range(10)]
+all_tasks = [
+    (gene_index, id_genei, fold_idx)
+    for gene_index, id_genei in enumerate(id_all_gene)
+    for fold_idx in range(10)
+]
 
-all_results = Parallel(n_jobs=-1, verbose=1)(
-    delayed(run_gene_fold)(id_genei, fold_idx) for id_genei, fold_idx in tqdm(all_tasks, desc="Gene-Folds")
+all_results = Parallel(n_jobs=N_JOBS, verbose=1, backend="loky")(
+    delayed(run_gene_fold)(gene_index, id_genei, fold_idx)
+    for gene_index, id_genei, fold_idx in tqdm(all_tasks, desc="Gene-Folds")
 )
 
 all_results = [r for r in all_results if r is not None]
@@ -352,9 +398,9 @@ for r in all_results:
     contribution_results.extend(r[1])
 
 df_summary = pd.DataFrame(summary_results)
-df_summary.to_csv(".observed_results.csv", index=False)
+df_summary.to_csv(SCRIPT_DIR / ".observed_results.csv", index=False)
 
 df_contributions = pd.DataFrame(contribution_results)
-df_contributions.to_csv(".omics_contributions.csv", index=False)
+df_contributions.to_csv(SCRIPT_DIR / ".omics_contributions.csv", index=False)
 
 print("Done! Saved to .observed_results.csv and .omics_contributions.csv")
